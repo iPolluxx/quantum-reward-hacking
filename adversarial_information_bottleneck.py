@@ -13,10 +13,16 @@ def bayesian_floor(p_true):
     p_true = torch.clamp(p_true, 1e-7, 1 - 1e-7)
     return - (p_true * torch.log(p_true) + (1 - p_true) * torch.log(1 - p_true))
 
-def main_model_penalty(shadow_loss_value, bayesian_floor_value):
-    # ReLU ensures we don't accidentally reward the main model if numerical instability 
-    # pushes shadow loss slightly below the theoretical floor.
-    return torch.relu(shadow_loss_value - bayesian_floor_value)
+def calculate_game_penalties(shadow_loss_value, bayesian_floor_value):
+    # 1. Leakage Penalty: We want the Main Model to MAXIMIZE this (so it gets subtracted from total loss)
+    # This means the Shadow Network is failing to guess the coin flip.
+    leakage_reward = torch.relu(shadow_loss_value - bayesian_floor_value)
+    
+    # 2. Determinism Penalty: We want the Main Model to MINIMIZE this (so it gets added to total loss)
+    # This punishes the model if it tries to use a double-headed coin (entropy drops to 0).
+    determinism_penalty = (0.6931 - bayesian_floor_value)
+    
+    return leakage_reward, determinism_penalty
 
 # --- 2. Architectures ---
 
@@ -114,7 +120,7 @@ def run_adversarial_training():
         # 5. Compute the Bayesian Game Losses
         L_shadow = shadow_loss(q, m)
         H_p = bayesian_floor(p)
-        L_penalty = main_model_penalty(L_shadow.detach(), H_p)
+        leakage_reward, determinism_penalty = calculate_game_penalties(L_shadow.detach(), H_p)
         
         # --- Update Shadow Network ---
         shadow_opt.zero_grad()
@@ -130,9 +136,9 @@ def run_adversarial_training():
         # Downstream gradients (for the experts predicting the actual values)
         task_mse = -task_reward.mean() 
         
-        # The Main Model wants to MINIMIZE task error and MINIMIZE reinforce loss, 
-        # while MAXIMIZING the penalty on the shadow network (hence subtraction).
-        main_total_loss = task_mse + reinforce_loss - 2.0 * L_penalty.mean()
+        # The Main Model wants to MINIMIZE task error and MINIMIZE reinforce loss.
+        # It wants to MAXIMIZE leakage (subtract it) and MINIMIZE determinism (add it).
+        main_total_loss = task_mse + reinforce_loss - 2.0 * leakage_reward.mean() + 2.0 * determinism_penalty.mean()
         
         main_opt.zero_grad()
         main_total_loss.backward()
@@ -141,8 +147,9 @@ def run_adversarial_training():
         if epoch % 200 == 0:
             avg_p = p.mean().item()
             avg_q = q.mean().item()
-            excess_penalty = L_penalty.mean().item()
-            print(f"Epoch {epoch:4d} | Task MSE: {task_mse:.4f} | Avg p (Main): {avg_p:.3f} | Avg q (Shadow): {avg_q:.3f} | Shadow Excess Loss (Penalty): {excess_penalty:.4f}")
+            leak_r = leakage_reward.mean().item()
+            det_p = determinism_penalty.mean().item()
+            print(f"Epoch {epoch:4d} | Task MSE: {task_mse:.4f} | Avg p: {avg_p:.3f} | Avg q: {avg_q:.3f} | Leakage Rwd: {leak_r:.4f} | Determinism Pen: {det_p:.4f}")
 
 if __name__ == "__main__":
     run_adversarial_training()
